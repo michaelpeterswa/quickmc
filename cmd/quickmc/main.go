@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/FragLand/minestat/Go/minestat"
 	"github.com/gorilla/mux"
 	"github.com/michaelpeterswa/quickmc/internal/environment"
 	"github.com/michaelpeterswa/quickmc/internal/handlers"
@@ -25,44 +27,60 @@ func main() {
 	}
 	logger.Info("quickmc init...")
 
-	env := environment.LoadEnvironment()
+	if _, err := os.Stat("papermc.jar"); err != nil {
+		env := environment.LoadEnvironment()
 
-	paperMCClient := papermc.NewPaperMCClient(&http.Client{Timeout: 10 * time.Second})
-	buildNum, err := strconv.Atoi(env.Build)
-	if err != nil {
-		logger.Error("could not convert build number to int", zap.String("build", env.Build), zap.Error(err))
-	}
-	build, err := paperMCClient.GetBuild(env.Project, env.Version, buildNum)
-	if err != nil {
-		logger.Error("could not get build", zap.String("project", env.Project), zap.String("version", env.Version), zap.Int("build", buildNum), zap.Error(err))
-	}
-	link := papermc.GetDownloadLink(env.Project, env.Version, buildNum, build.Downloads.Application.Name)
-	logger.Info("download link", zap.String("link", link))
+		paperMCClient := papermc.NewPaperMCClient(&http.Client{Timeout: 30 * time.Second})
 
-	err = paperMCClient.Download(link, build.Downloads.Application.Sha256, "papermc.jar")
-	if err != nil {
-		logger.Error("could not download", zap.String("link", link), zap.String("sha256", build.Downloads.Application.Sha256), zap.Error(err))
-	}
+		buildParams, err := GetLatestBuild(paperMCClient, env)
+		if err != nil {
+			logger.Fatal("could not get latest build")
+		}
+		build, err := paperMCClient.GetBuild(buildParams.Project, buildParams.Version, buildParams.BuildNum)
+		if err != nil {
+			logger.Fatal("could not get build", zap.String("project", env.Project), zap.String("version", env.Version), zap.Int("build", buildParams.BuildNum), zap.Error(err))
+		}
+		link := papermc.GetDownloadLink(build.ProjectID, build.Version, build.Build, build.Downloads.Application.Name)
+		logger.Info("download link", zap.String("link", link))
 
-	err = os.Chmod("papermc.jar", 0755)
-	if err != nil {
-		logger.Error("could not chmod", zap.String("file", "papermc.jar"), zap.Error(err))
-	}
-	err = os.WriteFile("eula.txt", []byte("eula=true"), 0644)
-	if err != nil {
-		logger.Error("could not write eula", zap.Error(err))
+		err = paperMCClient.Download(link, build.Downloads.Application.Sha256, "papermc.jar")
+		if err != nil {
+			logger.Fatal("could not download", zap.String("link", link), zap.String("sha256", build.Downloads.Application.Sha256), zap.Error(err))
+		}
+
+		err = os.Chmod("papermc.jar", 0755)
+		if err != nil {
+			logger.Fatal("could not chmod", zap.String("file", "papermc.jar"), zap.Error(err))
+		}
+		err = os.WriteFile("eula.txt", []byte("eula=true"), 0644)
+		if err != nil {
+			logger.Fatal("could not write eula", zap.Error(err))
+		}
 	}
 
 	zapWriter := zapio.Writer{
 		Log:   logger,
 		Level: zap.InfoLevel,
 	}
-	serverStartCmd := exec.Command("java", "-Xms2g", "-Xmx2g", "-jar", "papermc.jar", "--nogui")
+	serverStartCmd := exec.Command("java", "-Xms4g", "-Xmx4g", "-jar", "papermc.jar", "--nogui")
 	serverStartCmd.Stdout = &zapWriter
 	err = serverStartCmd.Start()
 	if err != nil {
-		logger.Error("could not start server", zap.Error(err))
+		logger.Fatal("could not start server", zap.Error(err))
 	}
+
+	go func() {
+		time.Sleep(30 * time.Second)
+		minestat.Init("localhost", "25565")
+		fmt.Printf("Minecraft server status of %s on port %s:\n", minestat.Address, minestat.Port)
+		if minestat.Online {
+			fmt.Printf("Server is online running version %s with %s out of %s players.\n", minestat.Version, minestat.Current_players, minestat.Max_players)
+			fmt.Printf("Message of the day: %s\n", minestat.Motd)
+			fmt.Printf("Latency: %s\n", minestat.Latency)
+		} else {
+			fmt.Println("Server is offline!")
+		}
+	}()
 
 	r := mux.NewRouter()
 	r.HandleFunc("/healthcheck", handlers.HealthcheckHandler)
@@ -72,4 +90,43 @@ func main() {
 	if err != nil {
 		logger.Fatal("could not start http server", zap.Error(err))
 	}
+}
+
+type BuildParams struct {
+	Project  string
+	Version  string
+	BuildNum int
+}
+
+func GetLatestBuild(pmcc *papermc.PaperMCClient, env *environment.Environment) (*BuildParams, error) {
+	var buildParams = &BuildParams{}
+	if env.Project == "" {
+		buildParams.Project = "paper"
+	} else {
+		buildParams.Project = env.Project
+	}
+	if env.Version == "" {
+		proj, err := pmcc.GetProject(buildParams.Project)
+		if err != nil {
+			return nil, err
+		}
+		buildParams.Version = proj.Versions[len(proj.Versions)-1]
+	} else {
+		buildParams.Version = env.Version
+	}
+	if env.Build == "" {
+		builds, err := pmcc.GetVersion(buildParams.Project, buildParams.Version)
+		if err != nil {
+			return nil, err
+		}
+		buildParams.BuildNum = builds.Builds[len(builds.Builds)-1]
+	} else {
+		buildNum, err := strconv.Atoi(env.Build)
+		if err != nil {
+			return nil, err
+		}
+		buildParams.BuildNum = buildNum
+	}
+
+	return buildParams, nil
 }
